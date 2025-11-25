@@ -41,6 +41,9 @@ def build_forward_headers(incoming_headers) -> dict:
 
 
 def forward_to_fal(method: str, path: str, args, headers, body: bytes) -> Response:
+    """
+    Proxy générique /fal/<path> vers l’API Fal (texte -> image, etc.).
+    """
     url = build_fal_url(path)
     params = {k: v for k, v in args.lists()}
     fal_headers = build_forward_headers(headers)
@@ -67,8 +70,52 @@ def forward_to_fal(method: str, path: str, args, headers, body: bytes) -> Respon
     return Response(resp.content, status=resp.status_code, headers=clean_headers)
 
 
+def sanitize_extra_for_model(model_id: str, extra: dict) -> dict:
+    """
+    Ne garde que les paramètres supportés par le modèle
+    (d’après la doc Fal), pour éviter les 400/422.
+    """
+
+    if not isinstance(extra, dict):
+        return {}
+
+    # Nano Banana Pro edit
+    # https://fal.ai/models/fal-ai/nano-banana-pro/edit/api
+    if model_id == "fal-ai/nano-banana-pro/edit":
+        allowed = {
+            "num_images",
+            "aspect_ratio",
+            "output_format",
+            "sync_mode",
+            "image_urls",
+            "resolution",
+        }
+        return {k: v for k, v in extra.items() if k in allowed}
+
+    # Seedream v4 edit
+    # https://fal.ai/models/fal-ai/bytedance/seedream/v4/edit/api
+    if model_id == "fal-ai/bytedance/seedream/v4/edit":
+        allowed = {
+            "image_size",
+            "num_images",
+            "max_images",
+            "seed",
+            "sync_mode",
+            "enable_safety_checker",
+            "enhance_prompt_mode",
+            "image_urls",
+        }
+        return {k: v for k, v in extra.items() if k in allowed}
+
+    # Autres modèles : pas de filtrage
+    return extra
+
+
 def run_image_edit(model_id: str, prompt: str, files, extra_args=None) -> dict:
-    # Upload toutes les images vers Fal et appelle le modèle avec image_urls = [...]
+    """
+    Upload toutes les images vers Fal et appelle le modèle
+    avec image_urls = [...]
+    """
     fal_client.api_key = get_fal_key()
     image_urls = []
 
@@ -94,17 +141,19 @@ def run_image_edit(model_id: str, prompt: str, files, extra_args=None) -> dict:
     if not image_urls:
         raise RuntimeError("No valid images were uploaded")
 
+    extra = extra_args or {}
+    extra = sanitize_extra_for_model(model_id, extra)
+
     arguments = {
         "prompt": prompt,
         "image_urls": image_urls,
     }
-
-    if extra_args and isinstance(extra_args, dict):
-        arguments.update(extra_args)
+    arguments.update(extra)
 
     result = fal_client.run(model_id, arguments=arguments)
 
     if isinstance(result, dict):
+        # Pour debug : voir quelles URLs d’entrée ont servi
         result["_debug_image_urls"] = image_urls
 
     return result
@@ -115,6 +164,7 @@ app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
 def index():
+    # UI HTML (texte->image + image->image)
     return '''
 <!doctype html>
 <html lang="fr">
@@ -131,8 +181,8 @@ def index():
     img { border-radius: 4px; }
     #previewContainer img { max-width: 110px; margin-right: 10px; border:1px solid #ccc; padding:3px; }
     pre { background: #111; color:#0f0; padding:0.75rem; white-space: pre-wrap; }
-    .row{display:flex;gap:1rem;flex-wrap:wrap;margin-top:1rem;}
-    .row>div{flex:1 1 260px;}
+    .row { display:flex; gap:1rem; flex-wrap:wrap; margin-top:1rem; }
+    .row > div { flex:1 1 260px; }
     .hint { font-size: 0.85rem; color:#555; }
     .inline { display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap; }
     .inline > * { flex: 0 0 auto; }
@@ -201,9 +251,7 @@ def index():
 
   <label>Options avancées (JSON fusionné)
     <textarea id="editExtraJson">
-{
-  "enable_safety_checker": false
-}
+{}
     </textarea>
     <div class="hint">
       Les paramètres ci-dessus seront fusionnés avec ceux choisis dans les menus (image_size ou aspect_ratio / resolution).
@@ -306,16 +354,16 @@ function renderModelOptions() {
 
   if (model === "fal-ai/bytedance/seedream/v4/edit") {
     html += '<div class="inline">';
-    html += '<span>Taille d\\'image (Seedream) :</span>';
+    html += '<span>Taille d&#39;image (Seedream) :</span>';
     html += '<select id="seedreamSize">';
     html += '<option value="">(défaut)</option>';
     html += '<option value="auto">auto</option>';
-    html += '<option value="auto_2k">auto_2k</option>';
-    html += '<option value="auto_4k">auto_4k</option>';
+    html += '<option value="auto_2K">auto_2K</option>';
+    html += '<option value="auto_4K">auto_4K</option>';
     html += '<option value="square">square</option>';
     html += '<option value="square_hd">square_hd</option>';
-    html += '<option value="portrait_3_4">portrait_3_4</option>';
-    html += '<option value="portrait_9_16">portrait_9_16</option>';
+    html += '<option value="portrait_4_3">portrait_4_3</option>';
+    html += '<option value="portrait_16_9">portrait_16_9</option>';
     html += '<option value="landscape_4_3">landscape_4_3</option>';
     html += '<option value="landscape_16_9">landscape_16_9</option>';
     html += '<option value="custom">custom (width/height)</option>';
@@ -325,7 +373,7 @@ function renderModelOptions() {
     html += 'H:<input type="number" id="seedreamH" style="width:80px" min="256" step="64">';
     html += '</span>';
     html += '</div>';
-    html += '<div class="hint">Seedream : utilise image_size ou width/height pour custom.</div>';
+    html += '<div class="hint">Seedream : utilise image_size (enum) ou image_size = {width,height} pour custom.</div>';
   } else if (model === "fal-ai/nano-banana-pro/edit") {
     html += '<div class="inline">';
     html += '<span>Aspect ratio :</span>';
@@ -406,29 +454,20 @@ document.getElementById("editForm").addEventListener("submit", async (e) => {
     if (seedreamSize) {
       const val = seedreamSize.value;
       delete extra["image_size"];
-      delete extra["width"];
-      delete extra["height"];
 
       if (val === "custom") {
         const w = parseInt(document.getElementById("seedreamW").value || "0", 10);
         const h = parseInt(document.getElementById("seedreamH").value || "0", 10);
         if (w > 0 && h > 0) {
-          extra["width"] = w;
-          extra["height"] = h;
+          extra["image_size"] = { "width": w, "height": h };
         }
       } else if (val) {
         extra["image_size"] = val;
       }
     }
-    delete extra["aspect_ratio"];
-    delete extra["resolution"];
   } else if (model === "fal-ai/nano-banana-pro/edit") {
     const nanoAspect = document.getElementById("nanoAspect");
     const nanoRes = document.getElementById("nanoRes");
-
-    delete extra["image_size"];
-    delete extra["width"];
-    delete extra["height"];
 
     if (nanoAspect && nanoAspect.value) {
       extra["aspect_ratio"] = nanoAspect.value;
@@ -509,7 +548,7 @@ def ui_edit():
         result = run_image_edit(model, prompt, files, extra)
         return jsonify(result)
     except Exception as e:
-        return jsonify({"error":"edit_failed","detail":str(e)}), 500
+        return jsonify({"error": "edit_failed", "detail": str(e)}), 500
 
 
 if __name__ == "__main__":
